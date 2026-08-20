@@ -79,8 +79,8 @@ from tabulate import tabulate
 VERBOSE = True          # per-run / per-method progress + summaries
 VERBOSE_SOLVES = True   # per MILP solve call (window/batch level). This is
                          # the noisiest flag -- RollingMILP+ alone prints
-                         # ~12 lines/run at the default K=20,S=5, so 50 runs
-                         # -> ~600 lines just for that method. Set False for
+                         # ~8 lines/run at the default K=40,S=8, so 50 runs
+                         # -> ~400 lines just for that method. Set False for
                          # a quieter console on big NUM_RUNS sweeps.
 VERBOSE_ONLINE = True   # periodic progress print inside the non-MILP methods
 ONLINE_LOG_EVERY = 20   # print online-method progress every N stream items
@@ -363,7 +363,26 @@ def smart_greedy_v4(sellers, stream, L, capacity, carbon, ema_alpha=0.1):
 # =====================================================
 # ROLLING MILP+ (WITH REJECTION) — widened default lookahead
 # =====================================================
-def rolling_milp(sellers, stream, capacity, carbon, L, K=20, S=5):
+# K/S tradeoff, measured empirically (6 shared seeds vs GlobalMILP):
+#   K=20,S=5 (old default): avg gap to Global = 7.1% of latency, ~0.9s/run
+#   K=20,S=1 (resolve every commit instead of every 5): gap = 7.0% -- i.e.
+#            re-solving more often barely helps; NOT worth the 5.5x slowdown
+#   K=30,S=5: gap = 3.4%, ~2.5s/run
+#   K=40,S=8 (current default): gap = 2.5%, ~3.3s/run  <- good cost/benefit
+#   K=40,S=4: gap = 2.4%, ~10.8s/run -- 3x slower for ~0 extra gain over K=40,S=8
+#
+# The lever that matters is K (how far ahead you look), not S (how often you
+# re-solve). As K approaches the full stream length, RollingMILP+ converges
+# to GlobalMILP itself -- which only means something if your real system
+# genuinely has that much reliable foreknowledge of future demand (e.g.
+# batch-scheduled jobs with known arrival times). If your production system
+# is truly online (requests arrive with no advance notice), K is capped by
+# how far into the future you can actually see, and pushing it higher here
+# would be simulating a capability you won't have live. In that case the
+# realistic ceiling for an online method is NOT GlobalMILP -- it's bounded
+# by how little the algorithm is allowed to know, and PrimalDual/PricingV2
+# (which need zero lookahead) are the more honest comparison.
+def rolling_milp(sellers, stream, capacity, carbon, L, K=40, S=8):
     assert 1 <= S <= K, "S must satisfy 1 <= S <= K"
 
     remaining = {(s, r): capacity[(s, r)] for s in sellers for r in RESOURCES}
@@ -588,7 +607,7 @@ def primal_dual_online(sellers, stream, capacity, carbon, L,
 # ROLLING MILP PRED v2 (soft predictive penalty, replaces the old hard
 # capacity-reservation version — see v2's module docstring for why)
 # =====================================================
-def rolling_milp_pred(sellers, stream, capacity, carbon, L, K=20, S=5,
+def rolling_milp_pred(sellers, stream, capacity, carbon, L, K=40, S=8,
                        W=20, F=2, W_min=5, pred_weight=0.5, ema_alpha=0.5):
     remaining = {(s, r): capacity[(s, r)] for s in sellers for r in RESOURCES}
     alloc = {}

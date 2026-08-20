@@ -780,7 +780,7 @@ def main():
     for run in range(NUM_RUNS):
         print(f"Run {run+1}/{NUM_RUNS}")
 
-        np.random.seed(BASE_SEED + run)
+        # np.random.seed(BASE_SEED + run)
 
         buyers, sellers, L = build_topology()
         capacity, carbon = generate_capacities(sellers)

@@ -1,0 +1,90 @@
+version: "3.8"
+
+x-common-env: &common-env
+  REDIS_HOST: redis
+  REDIS_PORT: "6379"
+  WORLD_SEED: "42"          # MUST match across api + all 4 workers (it does, via this anchor)
+  NUM_SELLERS: "48"
+  LOG_LEVEL: "INFO"
+
+services:
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    command: ["redis-server", "--appendonly", "yes"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  api:
+    build: .
+    ports:
+      - "8080:8080"
+    environment:
+      <<: *common-env
+    depends_on:
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  worker-rolling-milp:
+    build: .
+    command: ["python", "-m", "workers.worker_rolling_milp"]
+    environment:
+      <<: *common-env
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  worker-rolling-milp-pred:
+    build: .
+    command: ["python", "-m", "workers.worker_rolling_milp_pred"]
+    environment:
+      <<: *common-env
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  worker-batch-milp:
+    build: .
+    command: ["python", "-m", "workers.worker_batch_milp"]
+    environment:
+      <<: *common-env
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  worker-primal-dual:
+    build: .
+    command: ["python", "-m", "workers.worker_primal_dual"]
+    environment:
+      <<: *common-env
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  comparator:
+    build: .
+    command: ["python", "-m", "workers.comparator"]
+    environment:
+      <<: *common-env
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  redis-data:

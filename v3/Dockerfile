@@ -8,7 +8,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         curl \
     && rm -rf /var/lib/apt/lists/*
 
-WORKDIR /app
+WORKDIR /seller_workload_opt/v3
 
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
@@ -20,9 +20,9 @@ COPY workers ./workers
 COPY scripts ./scripts
 
 ENV PYTHONUNBUFFERED=1 \
-    PYTHONPATH=/app
+    PYTHONPATH=/seller_workload_opt
 
 # Default command runs the API; docker-compose overrides `command` for
 # each of the 4 workers and the comparator using this same image.
-EXPOSE 8080
+EXPOSE 5801
 CMD ["gunicorn", "--bind", "0.0.0.0:5801", "--workers", "1", "--threads", "4", "--timeout", "60", "api.app:app"]

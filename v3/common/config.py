@@ -16,7 +16,7 @@ def _float(name, default):
 
 # --- Redis ---------------------------------------------------------------
 REDIS_HOST = os.environ.get("REDIS_HOST", "redis")
-REDIS_PORT = _int("REDIS_PORT", 6380)
+REDIS_PORT = _int("REDIS_PORT", 6379)
 REDIS_DB = _int("REDIS_DB", 0)
 
 DEMAND_STREAM = os.environ.get("DEMAND_STREAM", "demand-stream")

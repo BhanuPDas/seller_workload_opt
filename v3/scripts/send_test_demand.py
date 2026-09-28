@@ -27,6 +27,7 @@ def make_demand(buyer_id):
             "cpu": {"demand_per_unit": random.randint(2, 30)},
             "mem": {"demand_per_unit": random.randint(4, 32)},
             "gpu": {"demand_per_unit": random.randint(0, 2)},
+            "storage": {"demand_per_unit": random.randint(0, 100)},
         },
     }
 

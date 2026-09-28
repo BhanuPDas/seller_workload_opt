@@ -3,18 +3,20 @@
 Implements the design discussed: a single ingestion API pushes every
 buyer demand request onto one Redis Stream, and all 4 algorithms
 (RollingMILP+, RollingMILPPred, BatchMILP+, PrimalDual) consume the
-identical stream independently, each with its own private simulated
-seller-capacity ledger, so you can compare what each one would have
-decided on the exact same input. A comparator service joins the 4
-results per demand item and logs which one is "most optimal."
+identical stream independently, each with its own private capacity
+ledger, so you can compare what each one would have decided on the
+exact same input. A comparator service joins the 4 results per demand
+item and logs which one is "most optimal."
 
-**Nothing here commits real seller capacity.** Per your instructions,
-seller capacity/carbon/topology is a simulated, deterministic stand-in
-(`common/world.py`) — the one module you'll swap out when this is wired
-to real seller discovery. Every other module only talks to the world
-through that module's interface (`sellers`, `capacity`, `carbon`,
-`latency_for_buyer`), so that swap shouldn't require touching the
-algorithm or worker code.
+**Nothing here commits real seller capacity.** Seller capacity/carbon
+comes from a live Redis Stream that real sellers publish their own
+state to (`common/world.py`'s `SellerWorld`) — see **Live seller data**
+below for the message shape and the capacity-reconciliation policy.
+Every other module only talks to the world through its interface
+(`sellers`, `capacity`, `carbon`, `latency_for_buyer`, `snapshot`), so
+that data source can change again later without touching the algorithm
+or worker code — that's exactly what just happened going from the
+original simulated capacity to this live-seller version.
 
 ## Why 4 independent workers instead of 1 shared allocator
 
@@ -23,10 +25,99 @@ RollingMILP+/RollingMILPPred/BatchMILP+ jointly optimize a *window* or
 which other items were in its window. So "run the same request through
 all 4" can't mean 4 synchronous function calls returning at once; three
 of the four only decide once enough items have buffered. Each worker
-keeps its own private `remaining` capacity dict, seeded identically
-(same `WORLD_SEED` across all services), so the four are compared fairly
-on identical starting conditions rather than reacting to each other's
+keeps its own private `remaining` capacity dict, reconciled against the
+same live seller telemetry (see below), so the four are compared fairly
+against identical seller state rather than reacting to each other's
 allocations.
+
+## Live seller data
+
+Sellers publish their own state to a Redis Stream (`SELLER_STREAM`,
+default `seller-updates`) — plain `XADD`, no consumer group, since every
+process that needs seller state (the API + all 4 workers) independently
+tails the full stream: this is reference data everyone needs a complete
+copy of, not a work queue to divide up. See `common/world.py`'s module
+docstring for the exhaustive version of everything below; the parsing
+lives entirely in `_parse_seller_message()` there, which is the one
+function to edit if your real message shape differs.
+
+**Real seller message shape** — each seller reports:
+
+```json
+{
+  "node": "clab-nebula-extended-serf1",
+  "collected_at": "2026-09-28T14:32:10Z",
+  "sellable": {
+    "cpu": 238.0,
+    "ram": 1902.0,
+    "GPU": 0.0,
+    "storage": 687.0
+  }
+}
+```
+
+| field | required | meaning |
+|---|---|---|
+| `node` | yes | the seller id; anything else is skipped + logged as malformed |
+| `collected_at` | no | ISO8601 timestamp of the seller's own reading; stored as metadata only — staleness is judged by this process's local receipt time (`last_seen`/`SELLER_STALE_AFTER_SECONDS`), not `collected_at`, to avoid clock skew across nodes |
+| `sellable.cpu`, `sellable.ram`, `sellable.GPU`, `sellable.storage` | no (default 0) | **currently available** capacity for that resource — not total/max, see below. Matched case-insensitively and aliased onto our internal names (`ram`→`mem`, `GPU`→`gpu`, `storage` stays `storage`) |
+| `carbon` | no (default `DEFAULT_CARBON`) | not part of the real seller schema (sellers don't report this) — same carbon-cost term used in the objective today, accepted at the top level if a bridge ever adds it |
+| `region`, `lat`, `lon` | no | not used for anything real yet — see latency note below |
+
+`storage` is tracked as a genuine 4th allocatable resource dimension
+(`RESOURCES = ["cpu", "mem", "gpu", "storage"]` in `common/config.py`) —
+buyers can request it via `resources.storage.demand_per_unit` and every
+algorithm's capacity constraints and cost terms cover it exactly like
+cpu/mem/gpu (all four loop generically over `RESOURCES`).
+
+**Wire format on the stream**: Redis Streams can only hold flat
+string→string fields, so the nested JSON above has to be flattened
+somehow before it reaches `XADD`. `_parse_seller_message()` in
+`common/world.py` accepts whichever of three shapes the real
+seller→Redis bridge uses, without needing further changes: the whole
+document JSON-encoded into a single field's value (what
+`scripts/publish_fake_seller.py` does, and the most likely real shape),
+dotted-flattened keys (`sellable.cpu`), or bare flattened keys (`cpu`,
+`ram`, `GPU`, `storage` alongside `node` at the top level).
+
+**Capacity authority: "seller's next update overwrites ours."** Every
+fresh message for a seller replaces this registry's number for that
+seller outright. Each algorithm keeps decrementing its own private
+`remaining` between refreshes (via `resync_remaining()`, called at the
+top of every decision) so a run still shows a consistent, depleting
+picture within one algorithm's own sequence of hypothetical decisions —
+but the moment a seller publishes again, that seller's capacity snaps to
+whatever was just reported, discarding whatever we'd locally guessed.
+This keeps feasibility checks grounded in what's actually free right
+now, which matters because this is still a non-committing shadow
+harness — nothing here ever reduces a real seller's actual capacity.
+
+If your real sellers instead publish **total** capacity rather than
+currently-available, either have whatever bridges them to this stream
+compute and publish `available = total - in_use` (cleanest, keeps this
+file unchanged), or say so and I'll wire up the other reconciliation
+policy — tracking total separately and letting only *our own* commits
+reduce `remaining`, never the seller's report. That's a materially
+different policy from what's implemented now, not a small tweak.
+
+**Latency** has no real network/geo model wired up yet — every seller
+gets a flat `DEFAULT_LATENCY` regardless of `region`/`lat`/`lon`, until
+there's a real distance/RTT source to plug into
+`SellerWorld._estimate_latency()`.
+
+**Sellers are fully dynamic now**: a new `node` is picked up the
+moment it first publishes (no restart needed — verified by publishing a
+new seller mid-run and watching it show up in the very next decision),
+and a seller that hasn't published in `SELLER_STALE_AFTER_SECONDS`
+(default 180s) is dropped from the active pool and logged as offline.
+
+**Testing without real sellers connected yet**: `scripts/publish_fake_seller.py`
+publishes synthetic seller telemetry in the exact expected shape —
+either a one-shot batch (`--count 48`) or a looping heartbeat
+(`--loop --interval 30`, useful so sellers don't get expired as stale
+mid-test). `docker compose --profile test up seed-sellers` runs this
+automatically as its own service (not started by `docker compose up`
+alone — remove that service once real sellers are wired up).
 
 ## Architecture
 
@@ -60,7 +151,18 @@ cursor and pending-entries list.
 docker compose up --build
 ```
 
-This starts: `redis`, `api` (port 8080), the 4 workers, and `comparator`.
+This starts: `redis`, `api` (port 8080), the 4 workers, and `comparator`
+— but with no real sellers connected yet, everything will reject until
+at least one seller publishes to `seller-updates` (see **Live seller
+data** below). For local testing before that's wired up:
+
+```bash
+docker compose --profile test up --build seed-sellers
+```
+
+Check `curl http://localhost:8080/sellers` to confirm sellers are known
+before chasing "everything gets rejected" through the algorithm logs.
+
 Watch any single algorithm's behavior in isolation with, e.g.:
 
 ```bash
@@ -81,7 +183,8 @@ curl -X POST http://localhost:8080/submit_demand \
     "resources": {
       "cpu": {"demand_per_unit": 8},
       "mem": {"demand_per_unit": 16},
-      "gpu": {"demand_per_unit": 1}
+      "gpu": {"demand_per_unit": 1},
+      "storage": {"demand_per_unit": 50}
     }
   }'
 ```
@@ -163,18 +266,5 @@ BatchMILP+ could stall indefinitely if buyers arrive slower than
 
 - **A worker restart loses its cumulative capacity ledger, not just its in-flight buffer.** Crash recovery is verified end-to-end for *undelivered/uncommitted* items: if a worker dies mid-window, `XAUTOCLAIM` reclaims whatever was buffered-but-not-yet-committed on startup and re-feeds it (tested above by hard-killing `worker-rolling-milp` mid-window). What is **not** implemented is rebuilding `remaining` capacity from *already-committed* history — a fresh process starts from `world.initial_remaining()` again, so a restart effectively "forgets" every allocation the crashed instance had already committed. For a short-lived comparison run this is harmless; before this runs unattended for any length of time, add the event-sourcing replay mentioned in the earlier design discussion (append every commit to a durable log, replay it — or a periodic snapshot — on startup).
 - **Single active instance per algorithm.** Each algorithm's consumer group assumes one live consumer owning that algorithm's `remaining` dict; running two replicas of the same worker would double-allocate capacity, same reasoning as the original simulation's single-threaded loop.
-- **Simulated world only** — see the section below for what to swap.
-
-## What to change when real sellers replace the simulation
-
-Everything funnels through `common/world.py`'s `SimulatedWorld` class.
-Replace `get_world()` with something backed by real seller
-discovery/capacity/topology behind the same 4 methods
-(`sellers`, `capacity`, `carbon`, `latency_for_buyer`) and the API,
-algorithms, and workers don't need to change. The one thing to preserve:
-whatever replaces it must give an identical view to all 4 workers at any
-given moment for the comparison to stay meaningful — if you move to real
-sellers you'll need to decide whether the 4 workers read a shared live
-capacity snapshot (introduces the concurrency questions we discussed
-separately) or continue to run against their own independent replicas
-for pure comparison purposes.
+- **No real latency model yet** — see "Live seller data" above; every seller currently scores the same flat latency.
+- **Seller catch-up cost scales with total historical messages on `SELLER_STREAM`, not seller count.** If nothing trims that stream (`XADD ... MAXLEN ~ N` on the producer side), a newly-started process's startup catch-up gets slower over time even though the number of distinct sellers stays the same.

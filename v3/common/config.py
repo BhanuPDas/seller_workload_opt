@@ -15,32 +15,43 @@ def _float(name, default):
 
 
 # --- Redis ---------------------------------------------------------------
-REDIS_HOST = os.environ.get("REDIS_HOST", "localhost")
-REDIS_PORT = _int("REDIS_PORT", 6379)
+REDIS_HOST = os.environ.get("REDIS_HOST", "redis")
+REDIS_PORT = _int("REDIS_PORT", 6380)
 REDIS_DB = _int("REDIS_DB", 0)
 
 DEMAND_STREAM = os.environ.get("DEMAND_STREAM", "demand-stream")
 DECISIONS_STREAM = os.environ.get("DECISIONS_STREAM", "decisions-stream")
 DECISION_KEY_TTL_SECONDS = _int("DECISION_KEY_TTL_SECONDS", 7 * 24 * 3600)
 
-# --- Simulated world (stand-in for real seller discovery/capacity) -------
-# IMPORTANT: this seed must be identical across the API and all 4 workers
-# so every algorithm is scored against an *identical* initial world. Each
-# worker still keeps its own private, independently-mutated copy of
-# `remaining capacity` after that -- see common/world.py.
-WORLD_SEED = _int("WORLD_SEED", 42)
-NUM_SELLERS = _int("NUM_SELLERS", 48)
-BUYER_DEGREE = _int("BUYER_DEGREE", 5)  # sellers each buyer is "wired" to
+# --- Live seller world (real sellers publish here -- see common/world.py) --
+# Every process that needs seller state (the API + all 4 workers) tails
+# this stream independently with a plain XREAD (no consumer group --
+# this is reference data everyone needs a full copy of, not a work queue
+# to fan out). Each stream entry is one seller's current reported state;
+# see common/world.py's module docstring for the expected field shape
+# and how to adapt it to your real message format.
+SELLER_STREAM = os.environ.get("SELLER_STREAM", "seller-updates")
+# A seller not heard from in this long is dropped from the active pool
+# (treated as offline) rather than kept around on stale numbers forever.
+# Set to 0 to disable expiry entirely.
+SELLER_STALE_AFTER_SECONDS = _int("SELLER_STALE_AFTER_SECONDS", 180)
+# Fallback values used only when a seller's message omits that field.
+DEFAULT_CARBON = _float("DEFAULT_CARBON", 5.0)
+# No real buyer<->seller network/geo model yet -- every seller gets this
+# flat latency unless/until real location data is being published (see
+# world.py's _estimate_latency()).
+DEFAULT_LATENCY = _float("DEFAULT_LATENCY", 10.0)
 
 # --- Objective weights (same as the validated simulation) ----------------
 ALPHA = _float("ALPHA", 1.0)
 BETA = _float("BETA", 0.3)
 REJECTION_PENALTY = _float("REJECTION_PENALTY", 100.0)
-RESOURCES = ["cpu", "mem", "gpu"]
+RESOURCES = ["cpu", "mem", "gpu", "storage"]
 GAMMA_SCARCITY = {
     "cpu": _float("GAMMA_SCARCITY_CPU", 0.5),
     "mem": _float("GAMMA_SCARCITY_MEM", 0.15),
     "gpu": _float("GAMMA_SCARCITY_GPU", 1.0),
+    "storage": _float("GAMMA_SCARCITY_STORAGE", 0.1),
 }
 
 # --- RollingMILP+ ----------------------------------------------------------

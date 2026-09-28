@@ -25,4 +25,4 @@ ENV PYTHONUNBUFFERED=1 \
 # Default command runs the API; docker-compose overrides `command` for
 # each of the 4 workers and the comparator using this same image.
 EXPOSE 8080
-CMD ["gunicorn", "--bind", "0.0.0.0:8080", "--workers", "1", "--threads", "4", "--timeout", "60", "api.app:app"]
+CMD ["gunicorn", "--bind", "0.0.0.0:5801", "--workers", "1", "--threads", "4", "--timeout", "60", "api.app:app"]

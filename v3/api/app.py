@@ -19,10 +19,12 @@ from seller_workload_opt.v3.common.logging_setup import get_logger
 from seller_workload_opt.v3.common.models import DemandItem
 from seller_workload_opt.v3.common.redis_client import get_redis
 from seller_workload_opt.v3.common.decisions import read_all_decisions, comparison_key
+from seller_workload_opt.v3.common.world import get_world
 
 app = Flask(__name__)
 logger = get_logger("api")
 r = get_redis()
+world = get_world()
 
 SEQ_COUNTER_KEY = "demand:arrival_seq_counter"
 
@@ -54,7 +56,8 @@ def submit_demand():
       "resources": {
         "cpu": {"demand_per_unit": 8},
         "mem": {"demand_per_unit": 16},
-        "gpu": {"demand_per_unit": 1}
+        "gpu": {"demand_per_unit": 1},
+        "storage": {"demand_per_unit": 50}
       }
     }
     """
@@ -83,7 +86,7 @@ def submit_demand():
             logger.info(f"No active resource demands in request: {data}")
             return build_error("At least one resource must have demand_per_unit > 0")
 
-        unknown = set(active_resources) - {"cpu", "mem", "gpu"}
+        unknown = set(active_resources) - {"cpu", "mem", "gpu", "storage"}
         if unknown:
             logger.info(f"Unsupported resource types requested: {unknown}")
             return build_error(f"Unsupported resource types: {sorted(unknown)}")
@@ -100,6 +103,7 @@ def submit_demand():
             cpu=float(active_resources.get("cpu", {}).get("demand_per_unit", 0)),
             mem=float(active_resources.get("mem", {}).get("demand_per_unit", 0)),
             gpu=float(active_resources.get("gpu", {}).get("demand_per_unit", 0)),
+            storage=float(active_resources.get("storage", {}).get("demand_per_unit", 0)),
             arrival_seq=arrival_seq,
             arrival_ts=arrival_ts,
             ip=ip,
@@ -162,12 +166,37 @@ def get_decision(demand_id):
     }), 200
 
 
+@app.route("/sellers", methods=["GET"])
+def list_sellers():
+    """
+    Debug endpoint: what this process's SellerWorld currently believes
+    about the seller pool, straight off the live registry (not cached).
+    Useful for confirming sellers are actually reaching the stream before
+    chasing "everything gets rejected" through the algorithm logs.
+    """
+    snapshot = world.snapshot()
+    now = time.time()
+    sellers = {
+        sid: {
+            "capacity": info["capacity"],
+            "carbon": info["carbon"],
+            "seconds_since_last_update": round(now - info["last_seen"], 1),
+            "collected_at": info.get("collected_at"),
+        }
+        for sid, info in snapshot.items()
+    }
+    return jsonify({"count": len(sellers), "sellers": sellers}), 200
+
+
 @app.route("/", methods=["GET"])
 def index():
     return jsonify({
         "service": "marketplace-allocator-api",
         "algorithms": ALGORITHMS,
-        "endpoints": ["/submit_demand [POST]", "/decision/<demand_id> [GET]", "/health [GET]"],
+        "endpoints": [
+            "/submit_demand [POST]", "/decision/<demand_id> [GET]",
+            "/sellers [GET]", "/health [GET]",
+        ],
     }), 200
 
 

@@ -13,7 +13,7 @@ from seller_workload_opt.v3.common.config import (
     RESOURCES, ALPHA, BETA, REJECTION_PENALTY,
     BATCH_SIZE, BATCH_MAX_WAIT_SECONDS, BATCH_SOLVE_TIME_LIMIT,
 )
-from seller_workload_opt.v3.algorithms.common import binval, solved_ok, cost_of, rejected_decision
+from seller_workload_opt.v3.algorithms.common import binval, solved_ok, cost_of, rejected_decision, resync_remaining
 
 
 class BatchMilpProcessor:
@@ -27,7 +27,8 @@ class BatchMilpProcessor:
         self.max_wait = max_wait
         self.time_limit = time_limit
 
-        self.remaining = world.initial_remaining()
+        self.remaining = {}
+        self.last_synced = {}
         self.buffer = []
         self.first_buffered_at = None
         self.batch_idx = 0
@@ -63,29 +64,39 @@ class BatchMilpProcessor:
         return []
 
     def _solve(self, reason):
+        resync_remaining(self.remaining, self.last_synced, self.world)
+        sellers = self.world.sellers
+        carbon = self.world.carbon
+
         batch = self.buffer
         batch_id = f"batch-{self.batch_idx}"
         member_ids = [it.demand_id for _, it in batch]
 
+        if not sellers:
+            self.log.warning(
+                f"batch_id={batch_id}: 0 sellers known -- every item in this batch will "
+                f"be rejected. Check that sellers are publishing to the seller stream."
+            )
+
         model = pl.LpProblem("BatchMILP", pl.LpMinimize)
         y = {(j, s): pl.LpVariable(f"y_{j}_{s}", cat="Binary")
-             for j in range(len(batch)) for s in self.world.sellers}
+             for j in range(len(batch)) for s in sellers}
         z = {j: pl.LpVariable(f"z_{j}", cat="Binary") for j in range(len(batch))}
 
         for j in range(len(batch)):
-            model += pl.lpSum(y[(j, s)] for s in self.world.sellers) == z[j]
+            model += pl.lpSum(y[(j, s)] for s in sellers) == z[j]
 
-        for s in self.world.sellers:
+        for s in sellers:
             for r in RESOURCES:
                 model += pl.lpSum(
                     batch[j][1].demand()[r] * y[(j, s)] for j in range(len(batch))
-                ) <= self.remaining[(s, r)]
+                ) <= self.remaining.get((s, r), 0.0)
 
         model += (
             pl.lpSum(
-                (ALPHA * self.world.latency_for_buyer(batch[j][1].buyer_id)[s] + BETA * self.world.carbon[s])
+                (ALPHA * self.world.latency_for_buyer(batch[j][1].buyer_id)[s] + BETA * carbon[s])
                 * y[(j, s)]
-                for j in range(len(batch)) for s in self.world.sellers
+                for j in range(len(batch)) for s in sellers
             )
             + pl.lpSum(REJECTION_PENALTY * (1 - z[j]) for j in range(len(batch)))
         )
@@ -118,7 +129,7 @@ class BatchMilpProcessor:
                 )
             else:
                 chosen = None
-                for s in self.world.sellers:
+                for s in sellers:
                     if binval(y[(j, s)]) > 0.5:
                         chosen = s
                         break

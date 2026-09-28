@@ -19,7 +19,7 @@ from seller_workload_opt.v3.common.config import (
     PRED_K, PRED_S, PRED_MAX_WAIT_SECONDS, PRED_SOLVE_TIME_LIMIT,
     PRED_W, PRED_F, PRED_W_MIN, PRED_WEIGHT, PRED_EMA_ALPHA,
 )
-from seller_workload_opt.v3.algorithms.common import binval, solved_ok, cost_of, rejected_decision
+from seller_workload_opt.v3.algorithms.common import binval, solved_ok, cost_of, rejected_decision, resync_remaining, safe_ratio
 
 
 class RollingMilpPredProcessor:
@@ -41,7 +41,8 @@ class RollingMilpPredProcessor:
         self.pred_weight = pred_weight
         self.ema_alpha = ema_alpha
 
-        self.remaining = world.initial_remaining()
+        self.remaining = {}
+        self.last_synced = {}
         self.buffer = []
         self.since_last_solve = 0
         self.last_solve_time = time.time()
@@ -90,10 +91,21 @@ class RollingMilpPredProcessor:
         return {r: self.ema_demand[buyer_id][r] * self.F * conf for r in RESOURCES}
 
     def _solve(self, reason):
+        resync_remaining(self.remaining, self.last_synced, self.world)
+        sellers = self.world.sellers
+        carbon = self.world.carbon
+        capacity = self.world.capacity
+
         window = self.buffer[: self.K]
         commit_n = min(self.S, len(window))
         window_id = f"pred-w{self.window_idx}"
         member_ids = [it.demand_id for _, it in window]
+
+        if not sellers:
+            self.log.warning(
+                f"window_id={window_id}: 0 sellers known -- every item in this window will "
+                f"be rejected. Check that sellers are publishing to the seller stream."
+            )
 
         buyers_in_window = {it.buyer_id for _, it in window}
         forecast = {b: self._forecast_for(b) for b in buyers_in_window}
@@ -101,30 +113,30 @@ class RollingMilpPredProcessor:
 
         model = pl.LpProblem("RollingMILP_Pred", pl.LpMinimize)
         y = {(j, s): pl.LpVariable(f"y_{j}_{s}", cat="Binary")
-             for j in range(len(window)) for s in self.world.sellers}
+             for j in range(len(window)) for s in sellers}
         z = {j: pl.LpVariable(f"z_{j}", cat="Binary") for j in range(len(window))}
 
         for j in range(len(window)):
-            model += pl.lpSum(y[(j, s)] for s in self.world.sellers) == z[j]
+            model += pl.lpSum(y[(j, s)] for s in sellers) == z[j]
 
-        for s in self.world.sellers:
+        for s in sellers:
             for r in RESOURCES:
                 model += pl.lpSum(
                     window[j][1].demand()[r] * y[(j, s)] for j in range(len(window))
-                ) <= self.remaining[(s, r)]
+                ) <= self.remaining.get((s, r), 0.0)
 
         pred_cost = pl.lpSum(
             self.pred_weight
-            * sum(forecast[window[j][1].buyer_id][r] / self.world.capacity[(s, r)] for r in RESOURCES)
+            * sum(safe_ratio(forecast[window[j][1].buyer_id][r], capacity.get((s, r), 0.0)) for r in RESOURCES)
             * y[(j, s)]
-            for j in range(len(window)) for s in self.world.sellers
+            for j in range(len(window)) for s in sellers
         )
 
         model += (
             pl.lpSum(
-                (ALPHA * self.world.latency_for_buyer(window[j][1].buyer_id)[s] + BETA * self.world.carbon[s])
+                (ALPHA * self.world.latency_for_buyer(window[j][1].buyer_id)[s] + BETA * carbon[s])
                 * y[(j, s)]
-                for j in range(len(window)) for s in self.world.sellers
+                for j in range(len(window)) for s in sellers
             )
             + pred_cost
             + pl.lpSum(REJECTION_PENALTY * (1 - z[j]) for j in range(len(window)))
@@ -160,7 +172,7 @@ class RollingMilpPredProcessor:
                 )
             else:
                 chosen = None
-                for s in self.world.sellers:
+                for s in sellers:
                     if binval(y[(j, s)]) > 0.5:
                         chosen = s
                         break

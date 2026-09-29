@@ -9,6 +9,7 @@ x-common-env: &common-env
 services:
   selleropt:
     build: .
+    container_name: selleropt
     ports:
       - "5801:5801"
     environment:
@@ -23,6 +24,7 @@ services:
 
   worker-rolling-milp:
     build: .
+    container_name: rm
     command: [ "python", "-m", "workers.worker_rolling_milp" ]
     environment:
       <<: *common-env
@@ -32,6 +34,7 @@ services:
 
   worker-rolling-milp-pred:
     build: .
+    container_name: rmp
     command: [ "python", "-m", "workers.worker_rolling_milp_pred" ]
     environment:
       <<: *common-env
@@ -41,6 +44,7 @@ services:
 
   worker-batch-milp:
     build: .
+    container_name: bm
     command: [ "python", "-m", "workers.worker_batch_milp" ]
     environment:
       <<: *common-env
@@ -50,6 +54,7 @@ services:
 
   worker-primal-dual:
     build: .
+    container_name: pd
     command: [ "python", "-m", "workers.worker_primal_dual" ]
     environment:
       <<: *common-env
@@ -59,6 +64,7 @@ services:
 
   comparator:
     build: .
+    container_name: comparator
     command: [ "python", "-m", "workers.comparator" ]
     environment:
       <<: *common-env

@@ -1,0 +1,86 @@
+x-common-env: &common-env
+  REDIS_HOST: redis
+  REDIS_PORT: "6379"
+  SELLABLE_RESOURCES_HASH: "sellable_resources"   # real sellers' current state lives here; see common/world.py
+  SELLER_POLL_INTERVAL_SECONDS: "3"
+  SELLER_STALE_AFTER_SECONDS: "180"
+  LOG_LEVEL: "INFO"
+
+services:
+  selleropt:
+    build: .
+    ports:
+      - "5801:5801"
+    environment:
+      <<: *common-env
+    healthcheck:
+      test: [ "CMD", "curl", "-f", "http://localhost:5801/health" ]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    networks:
+      - clab
+
+  worker-rolling-milp:
+    build: .
+    command: [ "python", "-m", "workers.worker_rolling_milp" ]
+    environment:
+      <<: *common-env
+    restart: unless-stopped
+    networks:
+      - clab
+
+  worker-rolling-milp-pred:
+    build: .
+    command: [ "python", "-m", "workers.worker_rolling_milp_pred" ]
+    environment:
+      <<: *common-env
+    restart: unless-stopped
+    networks:
+      - clab
+
+  worker-batch-milp:
+    build: .
+    command: [ "python", "-m", "workers.worker_batch_milp" ]
+    environment:
+      <<: *common-env
+    restart: unless-stopped
+    networks:
+      - clab
+
+  worker-primal-dual:
+    build: .
+    command: [ "python", "-m", "workers.worker_primal_dual" ]
+    environment:
+      <<: *common-env
+    restart: unless-stopped
+    networks:
+      - clab
+
+  comparator:
+    build: .
+    command: [ "python", "-m", "workers.comparator" ]
+    environment:
+      <<: *common-env
+    restart: unless-stopped
+    networks:
+      - clab
+
+  # Not started by default (`docker compose up` skips anything with a
+  # profile). Run explicitly with `docker compose --profile test up
+  # seed-sellers` to publish synthetic seller telemetry every 30s --
+  # useful before real sellers are wired up to SELLABLE_RESOURCES_HASH,
+  # so the pipeline has something to allocate against. Remove/disable
+  # once real sellers are publishing.
+  seed-sellers:
+    build: .
+    command: [ "python", "scripts/publish_fake_seller.py", "--count", "48", "--loop", "--interval", "30" ]
+    environment:
+      <<: *common-env
+    profiles: [ "test" ]
+    networks:
+      - clab
+
+networks:
+  clab:
+    external: true

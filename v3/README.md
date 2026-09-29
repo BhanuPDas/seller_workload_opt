@@ -32,14 +32,36 @@ allocations.
 
 ## Live seller data
 
-Sellers publish their own state to a Redis Stream (`SELLER_STREAM`,
-default `seller-updates`) — plain `XADD`, no consumer group, since every
-process that needs seller state (the API + all 4 workers) independently
-tails the full stream: this is reference data everyone needs a complete
-copy of, not a work queue to divide up. See `common/world.py`'s module
-docstring for the exhaustive version of everything below; the parsing
-lives entirely in `_parse_seller_message()` there, which is the one
-function to edit if your real message shape differs.
+Sellers' current state lives in a Redis HASH (`SELLABLE_RESOURCES_HASH`,
+default `sellable_resources`) — one field per seller, keyed by node id,
+each value the seller's full JSON status document. Every process that
+needs seller state (the API + all 4 workers) independently polls this
+hash on an interval (`SELLER_POLL_INTERVAL_SECONDS`, default 3s): a
+single `HGETALL` always returns the complete, current state of every
+seller in one call, so there's no catch-up/replay step the way a stream
+would need, and the read cost scales with the number of sellers, not
+with how long the system has been running. See `common/world.py`'s
+module docstring for the exhaustive version of everything below; the
+parsing lives entirely in `_parse_seller_entry()` there, which is the one
+function to edit if your real document shape differs.
+
+```bash
+docker exec redis redis-cli HGETALL sellable_resources
+clab-nebula-extended-serf36
+{"node": "clab-nebula-extended-serf36", "collected_at": "2026-09-29T08:44:52Z", "sellable": {"cpu": 238.0, "ram": 1902.0, "GPU": 0.0, "storage": 689.0}}
+clab-nebula-extended-serf50
+{"node": "clab-nebula-extended-serf50", "collected_at": "2026-09-29T08:44:50Z", "sellable": {"cpu": 238.0, "ram": 1902.0, "GPU": 0.0, "storage": 688.0}}
+```
+
+There's also a `seller-updates` Stream in the same infra, which notifies
+on each individual seller update rather than holding the current state
+of all of them — kept as `SELLER_STREAM` in config for a possible future
+optimization (subscribe to it purely as a "something changed, poll
+sooner" trigger layered on top of the interval poll above), but
+`common/world.py` doesn't read from it today. The hash is a better fit
+for what the algorithms actually need — a complete, current picture of
+every seller before each decision — without needing to replay history to
+reconstruct it.
 
 **Real seller message shape** — each seller reports:
 
@@ -81,16 +103,32 @@ dotted-flattened keys (`sellable.cpu`), or bare flattened keys (`cpu`,
 `ram`, `GPU`, `storage` alongside `node` at the top level).
 
 **Capacity authority: "seller's next update overwrites ours."** Every
-fresh message for a seller replaces this registry's number for that
+fresh value for a seller replaces this registry's number for that
 seller outright. Each algorithm keeps decrementing its own private
 `remaining` between refreshes (via `resync_remaining()`, called at the
 top of every decision) so a run still shows a consistent, depleting
 picture within one algorithm's own sequence of hypothetical decisions —
-but the moment a seller publishes again, that seller's capacity snaps to
-whatever was just reported, discarding whatever we'd locally guessed.
-This keeps feasibility checks grounded in what's actually free right
-now, which matters because this is still a non-committing shadow
+but the moment a seller's hash entry changes, that seller's capacity
+snaps to whatever was just reported, discarding whatever we'd locally
+guessed. This keeps feasibility checks grounded in what's actually free
+right now, which matters because this is still a non-committing shadow
 harness — nothing here ever reduces a real seller's actual capacity.
+
+This doesn't fully close the race where a seller's real capacity changes
+between "we last polled" and "an algorithm commits a decision" — no
+read-then-decide design can, without an actual reserve/confirm handshake
+with the seller (a materially bigger piece of scope than this file).
+`SELLER_POLL_INTERVAL_SECONDS` controls how wide that gap can get;
+resync happening immediately before every decision keeps each
+algorithm's exposure as tight as the poll interval allows.
+
+**Staleness is judged by change, not presence.** Since every poll
+re-reads the whole hash, a seller sitting on a stale, unchanging value
+would look "present" on every single poll forever — so `SellerWorld`
+tracks the last time each seller's raw value actually *changed*, not the
+last time it was merely seen, and expires a seller whose value hasn't
+changed in `SELLER_STALE_AFTER_SECONDS`. A seller whose field disappears
+from the hash entirely is removed immediately, regardless of that timer.
 
 If your real sellers instead publish **total** capacity rather than
 currently-available, either have whatever bridges them to this stream
@@ -105,19 +143,25 @@ gets a flat `DEFAULT_LATENCY` regardless of `region`/`lat`/`lon`, until
 there's a real distance/RTT source to plug into
 `SellerWorld._estimate_latency()`.
 
-**Sellers are fully dynamic now**: a new `node` is picked up the
-moment it first publishes (no restart needed — verified by publishing a
-new seller mid-run and watching it show up in the very next decision),
-and a seller that hasn't published in `SELLER_STALE_AFTER_SECONDS`
-(default 180s) is dropped from the active pool and logged as offline.
+**Sellers are fully dynamic now**: a new `node` is picked up on the next
+poll after it first appears in the hash (within `SELLER_POLL_INTERVAL_SECONDS`,
+default 3s — verified by publishing a new seller mid-run and watching it
+show up shortly after), and a seller whose value hasn't changed in
+`SELLER_STALE_AFTER_SECONDS` (default 180s), or that disappears from the
+hash entirely, is dropped from the active pool and logged as offline.
 
 **Testing without real sellers connected yet**: `scripts/publish_fake_seller.py`
-publishes synthetic seller telemetry in the exact expected shape —
-either a one-shot batch (`--count 48`) or a looping heartbeat
+writes synthetic seller telemetry into the hash in the exact expected
+shape — either a one-shot batch (`--count 48`) or a looping heartbeat
 (`--loop --interval 30`, useful so sellers don't get expired as stale
-mid-test). `docker compose --profile test up seed-sellers` runs this
-automatically as its own service (not started by `docker compose up`
-alone — remove that service once real sellers are wired up).
+mid-test — each loop round is a fresh random draw, which counts as a
+change and resets the staleness clock same as a real seller reporting a
+fresh reading). `--remove <node>` deletes a seller's field entirely, to
+test the "vanished from the hash" offline path specifically rather than
+waiting out the staleness timer. `docker compose --profile test up
+seed-sellers` runs the looping form automatically as its own service
+(not started by `docker compose up` alone — remove that service once
+real sellers are wired up).
 
 ## Architecture
 
@@ -267,4 +311,4 @@ BatchMILP+ could stall indefinitely if buyers arrive slower than
 - **A worker restart loses its cumulative capacity ledger, not just its in-flight buffer.** Crash recovery is verified end-to-end for *undelivered/uncommitted* items: if a worker dies mid-window, `XAUTOCLAIM` reclaims whatever was buffered-but-not-yet-committed on startup and re-feeds it (tested above by hard-killing `worker-rolling-milp` mid-window). What is **not** implemented is rebuilding `remaining` capacity from *already-committed* history — a fresh process starts from `world.initial_remaining()` again, so a restart effectively "forgets" every allocation the crashed instance had already committed. For a short-lived comparison run this is harmless; before this runs unattended for any length of time, add the event-sourcing replay mentioned in the earlier design discussion (append every commit to a durable log, replay it — or a periodic snapshot — on startup).
 - **Single active instance per algorithm.** Each algorithm's consumer group assumes one live consumer owning that algorithm's `remaining` dict; running two replicas of the same worker would double-allocate capacity, same reasoning as the original simulation's single-threaded loop.
 - **No real latency model yet** — see "Live seller data" above; every seller currently scores the same flat latency.
-- **Seller catch-up cost scales with total historical messages on `SELLER_STREAM`, not seller count.** If nothing trims that stream (`XADD ... MAXLEN ~ N` on the producer side), a newly-started process's startup catch-up gets slower over time even though the number of distinct sellers stays the same.
+- **Seller freshness is bounded by `SELLER_POLL_INTERVAL_SECONDS` (default 3s), not instantaneous.** Since sellers are read via a periodic `HGETALL` rather than a tailed event stream, a capacity change can take up to one poll interval to be reflected. This is a tunable trade-off (lower = fresher, at the cost of one more `HGETALL` per interval — cheap even at 1-2s for realistic seller counts), not a fixed limitation like the old stream catch-up cost was.

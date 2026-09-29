@@ -24,15 +24,30 @@ DECISIONS_STREAM = os.environ.get("DECISIONS_STREAM", "decisions-stream")
 DECISION_KEY_TTL_SECONDS = _int("DECISION_KEY_TTL_SECONDS", 7 * 24 * 3600)
 
 # --- Live seller world (real sellers publish here -- see common/world.py) --
-# Every process that needs seller state (the API + all 4 workers) tails
-# this stream independently with a plain XREAD (no consumer group --
-# this is reference data everyone needs a full copy of, not a work queue
-# to fan out). Each stream entry is one seller's current reported state;
-# see common/world.py's module docstring for the expected field shape
-# and how to adapt it to your real message format.
+# Every process that needs seller state (the API + all 4 workers)
+# independently polls this Redis HASH -- one field per seller, keyed by
+# node id, value is that seller's full JSON status document. A HASH read
+# (HGETALL) always returns the complete, current state of every seller in
+# one call, so there's no catch-up/replay step the way a stream would
+# need -- see common/world.py's module docstring for the expected
+# document shape.
+SELLABLE_RESOURCES_HASH = os.environ.get("SELLABLE_RESOURCES_HASH", "sellable_resources")
+# How often each process re-reads SELLABLE_RESOURCES_HASH in the
+# background. Lower = fresher capacity data for the algorithms (bounds
+# the staleness window discussed for the race between "we read this" and
+# "algorithm decides on it"), at the cost of one more HGETALL per
+# interval -- cheap even at 1-2s for realistic seller counts, since cost
+# scales with the number of sellers, not with history.
+SELLER_POLL_INTERVAL_SECONDS = _float("SELLER_POLL_INTERVAL_SECONDS", 3.0)
+# Kept for a possible future optimization (subscribing to this stream
+# purely as a "something changed, poll sooner" trigger on top of the
+# interval above) -- common/world.py does not read from it today.
 SELLER_STREAM = os.environ.get("SELLER_STREAM", "seller-updates")
 # A seller not heard from in this long is dropped from the active pool
 # (treated as offline) rather than kept around on stale numbers forever.
+# "Heard from" means its hash entry's VALUE actually changed, or it
+# disappeared from the hash entirely -- not merely "still present, poll
+# after poll, with the same value" (see SellerWorld._apply_snapshot).
 # Set to 0 to disable expiry entirely.
 SELLER_STALE_AFTER_SECONDS = _int("SELLER_STALE_AFTER_SECONDS", 180)
 # Fallback values used only when a seller's message omits that field.
